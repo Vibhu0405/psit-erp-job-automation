@@ -1,202 +1,153 @@
+import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
-from tabulate import tabulate
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import os
-from dotenv import load_dotenv
 import pytz
+import pandas as pd
 
-load_dotenv()
+# -------------------------
+# STREAMLIT PAGE CONFIG
+# -------------------------
+st.set_page_config(page_title="ERP Job Automation", layout="wide")
 
-login_url = os.getenv("LOGIN_URL")
+st.title("🚀 ERP Job Automation Bot")
 
-credentials = {
-    "username": os.getenv("ERP_USERNAME"),
-    "password": os.getenv("ERP_PASSWORD")
-}
+# -------------------------
+# LOAD ENV VARIABLES
+# -------------------------
+LOGIN_URL = os.getenv("LOGIN_URL")
+JOB_INBOX_URL = os.getenv("JOB_INBOX_URL")
+ERP_USERNAME = os.getenv("ERP_USERNAME")
+ERP_PASSWORD = os.getenv("ERP_PASSWORD")
 
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+RECEIVER_EMAIL = os.getenv("SENDER_EMAIL_ADDRESS")
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-session = requests.Session()
-session.post(login_url, data=credentials)
+# -------------------------
+# RUN BUTTON
+# -------------------------
+if st.button("Run Job Automation"):
 
-job_inbox_url = os.getenv("JOB_INBOX_URL")
-response = session.get(job_inbox_url)
+    st.info("Logging into ERP...")
 
-soup = BeautifulSoup(response.text, "html.parser")
+    session = requests.Session()
+    session.post(LOGIN_URL, data={
+        "username": ERP_USERNAME,
+        "password": ERP_PASSWORD
+    })
 
-# Indian Time
-ist = pytz.timezone("Asia/Kolkata")
-current_time = datetime.now(ist)
+    response = session.get(JOB_INBOX_URL)
+    soup = BeautifulSoup(response.text, "html.parser")
 
-jobs = soup.find_all("div", class_="row g-0")[:5]
+    ist = pytz.timezone("Asia/Kolkata")
+    current_time = datetime.now(ist)
 
-results = []
+    jobs = soup.find_all("div", class_="row g-0")[:5]
 
-for job in jobs:
+    results = []
+    email_sent_jobs = []
 
-    company_name = job.find("td", string="Company Name")
-    if company_name:
-        company_name = company_name.find_next("td").text.strip()
-    else:
-        company_name = "Unknown Company"
+    for job in jobs:
 
-    # Extract Last Date
-    last_date_tag = job.find("td", string="Last Date to Apply")
-    expired = False
-    last_date_text = ""
+        company_name = job.find("td", string="Company Name")
+        company_name = company_name.find_next("td").text.strip() if company_name else "Unknown"
 
-    if last_date_tag:
-        last_date_text = last_date_tag.find_next("td").text.strip()
+        last_date_tag = job.find("td", string="Last Date to Apply")
+        expired = False
+        last_date_text = ""
+
+        if last_date_tag:
+            last_date_text = last_date_tag.find_next("td").text.strip()
+            try:
+                last_date = datetime.strptime(last_date_text, "%d %b %Y [%H:%M]")
+                last_date = ist.localize(last_date)
+                if current_time > last_date:
+                    expired = True
+            except:
+                pass
+
+        applied_img = job.find("img", src=lambda x: x and "applied_successfully.png" in x)
+
+        if applied_img:
+            results.append([company_name, "Already Applied", applied_img.get("title", "")])
+            continue
+
+        if expired:
+            results.append([company_name, "Expired", last_date_text])
+            continue
+
+        link_tag = job.find("a", href=True)
+        if not link_tag:
+            continue
+
+        link = link_tag["href"]
+        job_id = link.strip("/").split("/")[-2]
+
+        # OPEN JOB PAGE
+        job_page = session.get(link)
+        job_soup = BeautifulSoup(job_page.text, "html.parser")
+
+        panel_body = job_soup.find("div", class_="panel-body")
+
+        if panel_body:
+            for form in panel_body.find_all("form"):
+                form.decompose()
+            full_html_content = str(panel_body)
+        else:
+            full_html_content = "<p>No content found</p>"
+
+        # APPLY
+        interested_url = f"https://erp.psit.ac.in/CR/Student_job_inbox_update/1/{job_id}"
+        session.get(interested_url)
+
+        # BUILD EMAIL
+        html_content = f"""
+        <html>
+        <body>
+        <h2>{company_name}</h2>
+        {full_html_content}
+        <hr>
+        <p>Automated ERP Job Notification</p>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"New Job Applied: {company_name}"
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = RECEIVER_EMAIL
+        msg.attach(MIMEText(html_content, "html"))
+
         try:
-            last_date = datetime.strptime(last_date_text, "%d %b %Y [%H:%M]")
-            last_date = ist.localize(last_date)
-            if current_time > last_date:
-                expired = True
-        except:
-            pass
+            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, RECEIVER_EMAIL, msg.as_string())
+            server.quit()
 
-    # Check applied image
-    applied_img = job.find("img", src=lambda x: x and "applied_successfully.png" in x)
+            email_sent_jobs.append(company_name)
+            results.append([company_name, "Applied + Email Sent", "Success"])
 
-    if applied_img:
-        applied_date = applied_img.get("title", "Already Applied")
-        results.append([company_name, "Already Applied", applied_date])
-        continue
+        except Exception as e:
+            results.append([company_name, "Email Failed", str(e)])
 
-    if expired:
-        results.append([company_name, "Expired", last_date_text])
-        continue
+    # -------------------------
+    # DISPLAY RESULTS
+    # -------------------------
+    df = pd.DataFrame(results, columns=["Company", "Status", "Details"])
 
-    # Extract job link
-    link_tag = job.find("a", href=True)
-    if not link_tag:
-        continue
+    st.success("Process Completed ✅")
+    st.dataframe(df, use_container_width=True)
 
-    link = link_tag["href"]
-    job_id = link.strip("/").split("/")[-2]
-
-        # ---------------------------------------
-    # OPEN JOB DESCRIPTION PAGE
-    # ---------------------------------------
-    job_page = session.get(link)
-    job_soup = BeautifulSoup(job_page.text, "html.parser")
-
-    # Get panel-body
-    panel_body = job_soup.find("div", class_="panel-body")
-
-    if panel_body:
-
-        # Remove all forms (modals, inputs, apply buttons)
-        for form in panel_body.find_all("form"):
-            form.decompose()
-
-        # Remove Interested / Not Interested section
-        interested_section = panel_body.find(string=lambda x: x and "Interested" in x)
-        if interested_section:
-            parent = interested_section.find_parent("table")
-            if parent:
-                parent.decompose()
-
-        # Convert to HTML
-        full_html_content = str(panel_body)
-
-    else:
-        full_html_content = "<p>No content found</p>"
-
-    
-    # Logo
-    logo_tag = job_soup.find("img")
-    logo_url = logo_tag["src"] if logo_tag else ""
-
-    # Job Description
-    jd_section = job_soup.find("h3", string=lambda x: x and "Job Description" in x)
-    job_description = jd_section.find_next("table").text.strip() if jd_section else "N/A"
-
-    # Selection Criteria
-    criteria_section = job_soup.find("h3", string=lambda x: x and "Selection Criteria" in x)
-    selection_criteria = criteria_section.find_next("table").text.strip() if criteria_section else "N/A"
-
-    # Selection Process
-    process_section = job_soup.find("h3", string=lambda x: x and "Selection Process" in x)
-    selection_process = process_section.find_next("table").text.strip() if process_section else "N/A"
-
-    # Degree
-    degree_section = job_soup.find("h3", string=lambda x: x and "Degree" in x)
-    degree = degree_section.find_next("table").text.strip() if degree_section else "N/A"
-
-    # SPOC
-    spoc_section = job_soup.find("h3", string=lambda x: x and "SPOC" in x)
-    spoc = spoc_section.find_next("table").text.strip() if spoc_section else "N/A"
-
-    # ---------------------------------------
-    # APPLY
-    # ---------------------------------------
-    interested_url = f"https://erp.psit.ac.in/CR/Student_job_inbox_update/1/{job_id}"
-    session.get(interested_url)
-
-    # ---------------------------------------
-    # BUILD EMAIL CONTENT
-    # ---------------------------------------
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <meta charset="UTF-8">
-    </head>
-    <body style="font-family: Arial; background:#f5f5f5; padding:20px;">
-
-    <div style="max-width:900px; margin:auto; background:white; padding:25px; border-radius:8px;">
-
-    <h2 style="text-align:center;">{company_name}</h2>
-
-    {full_html_content}
-
-    <hr>
-    <p style="font-size:12px; color:gray; text-align:center;">
-    Automated ERP Job Notification
-    </p>
-
-    </div>
-
-    </body>
-    </html>
-    """
-
-
-
-
-    # ---------------------------------------
-    # SEND EMAIL
-    # ---------------------------------------
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"New Job Applied: {company_name}"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = os.getenv("SENDER_EMAIL_ADDRESS")
-
-    part = MIMEText(html_content, "html")
-    msg.attach(part)
-
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, msg["To"], msg.as_string())
-        server.quit()
-
-        print(f"📧 Email sent for {company_name}")
-
-    except Exception as e:
-        print("Email sending failed:", e)
-
-
-# Print Table
-print("\n")
-print(tabulate(results, headers=["Company", "Status", "Details"], tablefmt="fancy_grid"))
+    if email_sent_jobs:
+        st.subheader("📧 Emails Sent For:")
+        for name in email_sent_jobs:
+            st.write(f"✔ {name}")
